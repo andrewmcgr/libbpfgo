@@ -36,6 +36,11 @@ static inline long PTR_ERR(const void *ptr) {
 }
 #endif
 
+// open is varadic, so we need to wrap it
+static inline int open2(const char *pathname, int flags) {
+	return open(pathname, flags);
+}
+
 extern void perfCallback(void *ctx, int cpu, void *data, __u32 size);
 extern void perfLostCallback(void *ctx, int cpu, __u64 cnt);
 
@@ -936,6 +941,30 @@ func doAttachKprobeLegacy(prog *BPFProg, kp string, isKretprobe bool) (*BPFLink,
 		prog:      prog,
 		linkType:  kpType,
 		eventName: kp,
+	}
+	prog.module.links = append(prog.module.links, bpfLink)
+	return bpfLink, nil
+}
+
+func (prog *BPFProg) AttachCgroup(cgroup string) (*BPFLink, error) {
+	// Go's OpenFile has no O_DIRECTORY, so do this with cgo.
+	cg := C.CString(cgroup)
+	f, err := C.open2(cg, C.O_DIRECTORY|C.O_RDONLY)
+	C.free(unsafe.Pointer(cg))
+	if f < 0 {
+		return nil, err
+	}
+
+	link := C.bpf_program__attach_cgroup(prog.prog, f)
+	if C.IS_ERR_OR_NULL(unsafe.Pointer(link)) {
+		return nil, errptrError(unsafe.Pointer(link), "failed to attach cgroup %s to program %s", cgroup, prog.name)
+	}
+
+	bpfLink := &BPFLink{
+		link:      link,
+		prog:      prog,
+		linkType:  Uretprobe + 1,
+		eventName: cgroup,
 	}
 	prog.module.links = append(prog.module.links, bpfLink)
 	return bpfLink, nil
