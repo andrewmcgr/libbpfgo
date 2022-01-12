@@ -13,10 +13,84 @@ package libbpfgo
 #include <asm-generic/unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <asm/unistd.h>
+#include <linux/kernel.h>
+#include <linux/bpf.h>
+#include <linux/btf.h>
+#include <linux/limits.h>
 #include <linux/perf_event.h>
 #include <linux/unistd.h>
 #include <string.h>
 #include <unistd.h>
+
+#ifndef DECLARE_LIBBPF_OPTS
+// Borrowed from bpf.h
+// Helper macro to declare and initialize libbpf options struct
+#define DECLARE_LIBBPF_OPTS(TYPE, NAME, ...)				    \
+	struct TYPE NAME = ({						    \
+		memset(&NAME, 0, sizeof(struct TYPE));			    \
+		(struct TYPE) {						    \
+			.sz = sizeof(struct TYPE),			    \
+			__VA_ARGS__					    \
+		};							    \
+	})
+#endif
+
+struct bpf_link {
+	int (*detach)(struct bpf_link *link);
+	void (*dealloc)(struct bpf_link *link);
+	char *pin_path;		// NULL, if not pinned
+	int fd;			// hook FD, -1 if not applicable
+	bool disconnected;
+};
+
+static int bpf_link__detach_fd(struct bpf_link *link)
+{
+	return close(link->fd);
+}
+
+static inline void * ERR_PTR(long error)
+{
+	return (void *) error;
+}
+
+static struct bpf_link *
+bpf_program__attach_fd_multi(const struct bpf_program *prog, int target_fd, int btf_id,
+		       const char *target_name)
+{
+	DECLARE_LIBBPF_OPTS(bpf_link_create_opts, opts,
+			    .target_btf_id = btf_id, .flags=BPF_F_ALLOW_MULTI);
+	enum bpf_attach_type attach_type;
+	char errmsg[128];
+	struct bpf_link *link;
+	int prog_fd, link_fd;
+
+	prog_fd = bpf_program__fd(prog);
+	if (prog_fd < 0) {
+		return ERR_PTR(-EINVAL);
+	}
+
+	link = calloc(1, sizeof(*link));
+	if (!link)
+		return ERR_PTR(-ENOMEM);
+	link->detach = &bpf_link__detach_fd;
+
+	attach_type = bpf_program__get_expected_attach_type(prog);
+	link_fd = bpf_link_create(prog_fd, target_fd, attach_type, &opts);
+	if (link_fd < 0) {
+		link_fd = -errno;
+		free(link);
+		return ERR_PTR(link_fd);
+	}
+	link->fd = link_fd;
+	return link;
+}
+
+struct bpf_link *
+bpf_program__attach_cgroup_multi(const struct bpf_program *prog, int cgroup_fd)
+{
+	return bpf_program__attach_fd_multi(prog, cgroup_fd, 0, "cgroup");
+}
 
 #ifndef MAX_ERRNO
 #define MAX_ERRNO       4095
@@ -196,47 +270,6 @@ err_out:
     return NULL;
 }
 
-static struct bpf_link *
-bpf_program__attach_fd_flags(const struct bpf_program *prog, int target_fd, int btf_id,
-		       const char *target_namei, int flags)
-{
-	DECLARE_LIBBPF_OPTS(bpf_link_create_opts, opts,
-			    .target_btf_id = btf_id, .flags=flags);
-	enum bpf_attach_type attach_type;
-	char errmsg[STRERR_BUFSIZE];
-	struct bpf_link *link;
-	int prog_fd, link_fd;
-
-	prog_fd = bpf_program__fd(prog);
-	if (prog_fd < 0) {
-		pr_warn("prog '%s': can't attach before loaded\n", prog->name);
-		return libbpf_err_ptr(-EINVAL);
-	}
-
-	link = calloc(1, sizeof(*link));
-	if (!link)
-		return libbpf_err_ptr(-ENOMEM);
-	link->detach = &bpf_link__detach_fd;
-
-	attach_type = bpf_program__get_expected_attach_type(prog);
-	link_fd = bpf_link_create(prog_fd, target_fd, attach_type, &opts);
-	if (link_fd < 0) {
-		link_fd = -errno;
-		free(link);
-		pr_warn("prog '%s': failed to attach to %s: %s\n",
-			prog->name, target_name,
-			libbpf_strerror_r(link_fd, errmsg, sizeof(errmsg)));
-		return libbpf_err_ptr(link_fd);
-	}
-	link->fd = link_fd;
-	return link;
-}
-
-struct bpf_link *
-bpf_program__attach_cgroup_flags(const struct bpf_program *prog, int cgroup_fd, int flags)
-{
-	return bpf_program__attach_fd_flags(prog, cgroup_fd, 0, "cgroup", flags);
-}
 */
 import "C"
 
@@ -997,9 +1030,9 @@ func (prog *BPFProg) AttachCgroup(cgroup string) (*BPFLink, error) {
 		return nil, err
 	}
 
-	link := C.bpf_program__attach_cgroup_flags(prog.prog, f, C.BPF_F_ALLOW_MULTI)
+	link := C.bpf_program__attach_cgroup_multi(prog.prog, f)
 	if C.IS_ERR_OR_NULL(unsafe.Pointer(link)) {
-		return nil, errptrError(unsafe.Pointer(link), "failed to attach cgroup %s to program %s", cgroup, prog.name)
+		return nil, errptrError(unsafe.Pointer(link), "failed to attach cgroup %s", cgroup)
 	}
 
 	bpfLink := &BPFLink{
