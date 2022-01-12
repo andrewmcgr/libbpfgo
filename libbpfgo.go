@@ -195,6 +195,48 @@ err_out:
     remove_kprobe_event(func_name, is_kretprobe);
     return NULL;
 }
+
+static struct bpf_link *
+bpf_program__attach_fd_flags(const struct bpf_program *prog, int target_fd, int btf_id,
+		       const char *target_namei, int flags)
+{
+	DECLARE_LIBBPF_OPTS(bpf_link_create_opts, opts,
+			    .target_btf_id = btf_id, .flags=flags);
+	enum bpf_attach_type attach_type;
+	char errmsg[STRERR_BUFSIZE];
+	struct bpf_link *link;
+	int prog_fd, link_fd;
+
+	prog_fd = bpf_program__fd(prog);
+	if (prog_fd < 0) {
+		pr_warn("prog '%s': can't attach before loaded\n", prog->name);
+		return libbpf_err_ptr(-EINVAL);
+	}
+
+	link = calloc(1, sizeof(*link));
+	if (!link)
+		return libbpf_err_ptr(-ENOMEM);
+	link->detach = &bpf_link__detach_fd;
+
+	attach_type = bpf_program__get_expected_attach_type(prog);
+	link_fd = bpf_link_create(prog_fd, target_fd, attach_type, &opts);
+	if (link_fd < 0) {
+		link_fd = -errno;
+		free(link);
+		pr_warn("prog '%s': failed to attach to %s: %s\n",
+			prog->name, target_name,
+			libbpf_strerror_r(link_fd, errmsg, sizeof(errmsg)));
+		return libbpf_err_ptr(link_fd);
+	}
+	link->fd = link_fd;
+	return link;
+}
+
+struct bpf_link *
+bpf_program__attach_cgroup_flags(const struct bpf_program *prog, int cgroup_fd, int flags)
+{
+	return bpf_program__attach_fd_flags(prog, cgroup_fd, 0, "cgroup", flags);
+}
 */
 import "C"
 
@@ -955,7 +997,7 @@ func (prog *BPFProg) AttachCgroup(cgroup string) (*BPFLink, error) {
 		return nil, err
 	}
 
-	link := C.bpf_program__attach_cgroup(prog.prog, f)
+	link := C.bpf_program__attach_cgroup_flags(prog.prog, f, C.BPF_F_ALLOW_MULTI)
 	if C.IS_ERR_OR_NULL(unsafe.Pointer(link)) {
 		return nil, errptrError(unsafe.Pointer(link), "failed to attach cgroup %s to program %s", cgroup, prog.name)
 	}
